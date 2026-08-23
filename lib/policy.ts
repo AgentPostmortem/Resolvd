@@ -50,6 +50,15 @@ export function decide(triage: Triage, payload: InboundPayload): Decision {
 
     case "refund": {
       const amount = triage.refundAmount ?? null;
+      if (amount != null && (!Number.isFinite(amount) || amount <= 0)) {
+        return {
+          status: "escalated",
+          proposedAction: "Confirm a valid refund amount, then approve",
+          actionTaken: null,
+          reason: "refund amount must be finite and greater than zero",
+          draftReply: triage.draftReply,
+        };
+      }
       if (amount != null && amount <= refundAutoLimit) {
         return {
           status: "resolved",
