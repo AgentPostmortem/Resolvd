@@ -50,7 +50,13 @@ export function decide(triage: Triage, payload: InboundPayload): Decision {
 
     case "refund": {
       const amount = triage.refundAmount ?? null;
-      if (amount != null && amount <= refundAutoLimit) {
+      const isAutoResolvable =
+        amount != null &&
+        Number.isFinite(amount) &&
+        amount > 0 &&
+        amount <= refundAutoLimit;
+
+      if (isAutoResolvable) {
         return {
           status: "resolved",
           proposedAction: `Issue refund of $${amount}`,
@@ -59,17 +65,28 @@ export function decide(triage: Triage, payload: InboundPayload): Decision {
           draftReply: `Hi, we've issued your refund of $${amount}. ${triage.draftReply}`,
         };
       }
+
+      let reason: string;
+      let proposedAction: string;
+      if (amount == null) {
+        reason = "refund amount not stated";
+        proposedAction = "Confirm refund amount, then approve";
+      } else if (!Number.isFinite(amount)) {
+        reason = `refund amount $${amount} is not a valid number`;
+        proposedAction = "Confirm refund amount, then approve";
+      } else if (amount <= 0) {
+        reason = `refund amount $${amount} is zero or negative`;
+        proposedAction = "Confirm refund amount, then approve";
+      } else {
+        reason = `refund $${amount} exceeds auto-limit $${refundAutoLimit}`;
+        proposedAction = `Approve refund of $${amount}`;
+      }
+
       return {
         status: "escalated",
-        proposedAction:
-          amount != null
-            ? `Approve refund of $${amount}`
-            : "Confirm refund amount, then approve",
+        proposedAction,
         actionTaken: null,
-        reason:
-          amount != null
-            ? `refund $${amount} exceeds auto-limit $${refundAutoLimit}`
-            : "refund amount not stated",
+        reason,
         draftReply: triage.draftReply,
       };
     }
