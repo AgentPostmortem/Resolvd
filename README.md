@@ -18,11 +18,24 @@ already attached.
 2. **Triage** classifies category, urgency, sentiment, and drafts a reply
    (Claude when `ANTHROPIC_API_KEY` is set; a keyword heuristic otherwise).
 3. **Policy** (the guardrail) decides:
-   - `order_status` with an order id -> auto-resolve (read-only lookup + reply)
-   - `refund` at or under `REFUND_AUTO_LIMIT` -> auto-issue + reply
-   - refund over the limit, complaints, or negative+high-urgency -> **escalate**
-     with the proposed action attached
-4. A human approves/rejects escalations via `POST /api/approve`.
+   - `order_status` with an order id -> auto-resolve (live Shopify lookup + reply)
+   - `refund` at or under `REFUND_AUTO_LIMIT`, pinned to one order -> auto-issue + reply
+   - refund over the limit, ambiguous orders, complaints, or negative+high-urgency
+     -> **escalate** with the proposed action attached
+   - anything needing an unconnected integration -> **escalate** with instructions
+     instead of acting
+4. A human approves/rejects escalations via `POST /api/approve`. Approving an
+   executable action runs it for real (refund/order lookup) and records the result.
+
+## Integrations
+
+| Integration | Env | Without it |
+|---|---|---|
+| Shopify store | `SHOPIFY_SHOP_DOMAIN`, `SHOPIFY_ACCESS_TOKEN` (custom app: `read_orders` + `write_orders`) | order/refund work escalates with instructions |
+| Reply email | `RESEND_API_KEY`, `RESEND_FROM_EMAIL` (verified sender) | replies saved as drafts for a human to send |
+
+Refunds resolve the order by explicit reference first, then by sender email only
+on an unambiguous single match. Multiple matches escalate rather than guess.
 
 The dashboard shows every ticket, the auto-resolution rate, what action was
 taken (or proposed), and the reason.
@@ -41,7 +54,17 @@ npm run dev
 npm run deploy
 ```
 
-Apply `supabase/schema.sql` in the Supabase SQL editor once.
+Apply `supabase/schema.sql` in the Supabase SQL editor once. On an existing
+database, also apply `supabase/migrations/002_add_source.sql` so demo rows
+get an explicit `source = 'demo'` tag (the dashboard also recognizes the
+built-in demo senders, so this is optional but recommended).
+
+Demo tickets are badged DEMO in the dashboard and can be hidden with the
+"Hide demo tickets" toggle, so evaluation traffic never mixes with live work.
+
+```bash
+npm test   # policy + triage unit tests
+```
 
 ## Examples
 
