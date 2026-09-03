@@ -1,103 +1,138 @@
 import type { InboundPayload, Triage } from "./types";
 
+export interface Integrations {
+  shopify: boolean;
+  email: boolean;
+}
+
+export function readIntegrations(env: NodeJS.ProcessEnv = process.env): Integrations {
+  return {
+    shopify: Boolean(env.SHOPIFY_SHOP_DOMAIN && env.SHOPIFY_ACCESS_TOKEN),
+    email: Boolean(env.RESEND_API_KEY && env.RESEND_FROM_EMAIL),
+  };
+}
+
+export type ExecutionPlan =
+  | { kind: "order_lookup" }
+  | { kind: "refund"; amount: number };
+
 export interface Decision {
   status: "resolved" | "escalated";
   proposedAction: string;
-  actionTaken: string | null; // set only when auto-resolved
+  actionTaken: string | null; // set only after successful execution
   reason: string;
   draftReply: string;
+  // Present when status is resolved: what the executor may run.
+  execution: ExecutionPlan | null;
 }
 
 // The guardrail layer. Decides whether the agent may act on its own or must
-// escalate to a human, given the triage and configured limits.
-export function decide(triage: Triage, payload: InboundPayload): Decision {
+// escalate to a human, given the triage, the configured limits, and which
+// integrations are actually connected. A resolved decision never executes
+// anything by itself; lib/execute.ts runs the plan and reports back.
+export function decide(
+  triage: Triage,
+  payload: InboundPayload,
+  integrations: Integrations = readIntegrations(),
+): Decision {
   const refundAutoLimit = Number(
     process.env.REFUND_AUTO_LIMIT ?? "50",
   );
+  const resolved = (
+    proposedAction: string,
+    execution: ExecutionPlan,
+    reason: string,
+  ): Decision => ({
+    status: "resolved",
+    proposedAction,
+    actionTaken: null,
+    reason,
+    draftReply: triage.draftReply,
+    execution,
+  });
+
+  const escalated = (proposedAction: string, reason: string): Decision => ({
+    status: "escalated",
+    proposedAction,
+    actionTaken: null,
+    reason,
+    draftReply: triage.draftReply,
+    execution: null,
+  });
 
   // Negative + high urgency always goes to a human, regardless of category.
   if (triage.sentiment === "negative" && triage.urgency === "high") {
-    return {
-      status: "escalated",
-      proposedAction: "Personal apology + offer remedy",
-      actionTaken: null,
-      reason: "negative sentiment at high urgency, needs a human touch",
-      draftReply: triage.draftReply,
-    };
+    return escalated(
+      "Personal apology + offer remedy",
+      "negative sentiment at high urgency, needs a human touch",
+    );
   }
 
   switch (triage.category) {
     case "order_status": {
       if (!payload.orderId) {
-        return {
-          status: "escalated",
-          proposedAction: "Ask customer for their order number",
-          actionTaken: null,
-          reason: "order status request without an order id",
-          draftReply: triage.draftReply,
-        };
+        return escalated(
+          "Ask customer for their order number",
+          "order status request without an order id",
+        );
       }
-      // Safe, read-only auto-resolution: look up status and reply.
-      const status = lookupOrderStatus(payload.orderId);
-      return {
-        status: "resolved",
-        proposedAction: `Reply with status for ${payload.orderId}`,
-        actionTaken: `Sent order status (${status}) for ${payload.orderId}`,
-        reason: "read-only lookup, safe to auto-handle",
-        draftReply: `Hi, your order ${payload.orderId} is currently "${status}". ${triage.draftReply}`,
-      };
+      if (!integrations.shopify) {
+        return escalated(
+          `Look up ${payload.orderId} in the store and reply`,
+          "store not connected, cannot verify live status",
+        );
+      }
+      // Safe, read-only auto-resolution: the executor looks up live status.
+      return resolved(
+        `Reply with live status for ${payload.orderId}`,
+        { kind: "order_lookup" },
+        "read-only lookup, safe to auto-handle",
+      );
     }
 
     case "refund": {
       const amount = triage.refundAmount ?? null;
-      if (amount != null && amount <= refundAutoLimit) {
-        return {
-          status: "resolved",
-          proposedAction: `Issue refund of $${amount}`,
-          actionTaken: `Issued refund of $${amount} (within $${refundAutoLimit} auto-limit)`,
-          reason: `refund $${amount} <= auto-limit $${refundAutoLimit}`,
-          draftReply: `Hi, we've issued your refund of $${amount}. ${triage.draftReply}`,
-        };
+      if (amount == null) {
+        return escalated(
+          "Confirm refund amount, then approve",
+          "refund amount not stated",
+        );
       }
-      return {
-        status: "escalated",
-        proposedAction:
-          amount != null
-            ? `Approve refund of $${amount}`
-            : "Confirm refund amount, then approve",
-        actionTaken: null,
-        reason:
-          amount != null
-            ? `refund $${amount} exceeds auto-limit $${refundAutoLimit}`
-            : "refund amount not stated",
-        draftReply: triage.draftReply,
-      };
+      if (amount > refundAutoLimit) {
+        return escalated(
+          `Approve refund of $${amount}`,
+          `refund $${amount} exceeds auto-limit $${refundAutoLimit}`,
+        );
+      }
+      if (!integrations.shopify) {
+        return escalated(
+          `Issue refund of $${amount} in the store`,
+          "store not connected, cannot move money automatically",
+        );
+      }
+      if (!payload.orderId && !payload.sender) {
+        return escalated(
+          `Confirm which order the $${amount} refund belongs to, then approve`,
+          "no order reference and no sender to match against",
+        );
+      }
+      return resolved(
+        `Issue refund of $${amount}`,
+        { kind: "refund", amount },
+        `refund $${amount} <= auto-limit $${refundAutoLimit}`,
+      );
     }
 
     case "complaint":
-      return {
-        status: "escalated",
-        proposedAction: "Review complaint and respond personally",
-        actionTaken: null,
-        reason: "complaints are routed to a human by policy",
-        draftReply: triage.draftReply,
-      };
+      return escalated(
+        "Review complaint and respond personally",
+        "complaints are routed to a human by policy",
+      );
 
     default:
-      return {
-        status: "escalated",
-        proposedAction: "Human review (uncategorized)",
-        actionTaken: null,
-        reason: "could not confidently categorize",
-        draftReply: triage.draftReply,
-      };
+      return escalated(
+        "Human review (uncategorized)",
+        "could not confidently categorize",
+      );
   }
-}
-
-// Stub order lookup. A real deployment calls Shopify / the OMS here (or routes
-// through Bridgekit). Deterministic so demos are stable.
-function lookupOrderStatus(orderId: string): string {
-  const states = ["processing", "shipped", "out for delivery", "delivered"];
-  const n = orderId.split("").reduce((a, c) => a + c.charCodeAt(0), 0);
-  return states[n % states.length];
 }

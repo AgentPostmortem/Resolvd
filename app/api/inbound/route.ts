@@ -1,7 +1,8 @@
 import { NextRequest, NextResponse } from "next/server";
 import { db, checkInboundToken } from "@/lib/supabase";
 import { triage } from "@/lib/agent";
-import { decide } from "@/lib/policy";
+import { decide, readIntegrations } from "@/lib/policy";
+import { executeResolution, liveAdapters } from "@/lib/execute";
 import type { InboundPayload } from "@/lib/types";
 
 export const runtime = "nodejs";
@@ -28,7 +29,36 @@ export async function POST(req: NextRequest) {
   }
 
   const t = await triage(body.subject ?? "", body.body);
-  const decision = decide(t, body);
+  const integrations = readIntegrations();
+  const decision = decide(t, body, integrations);
+
+  // A resolved decision carries an execution plan. Run it against the real
+  // integrations; anything that fails flips back to escalated with the cause.
+  let status = decision.status;
+  let proposedAction = decision.proposedAction;
+  let actionTaken = decision.actionTaken;
+  let reason = decision.reason;
+  if (decision.status === "resolved" && decision.execution) {
+    const { shop, mail } = liveAdapters();
+    const result = await executeResolution(
+      decision,
+      {
+        sender: body.sender,
+        subject: body.subject ?? "",
+        orderRef: body.orderId ?? null,
+      },
+      shop,
+      integrations.email ? mail : null,
+      false,
+    );
+    if (result.ok) {
+      actionTaken = result.actionTaken;
+    } else {
+      status = "escalated";
+      proposedAction = result.proposedAction;
+      reason = result.reason;
+    }
+  }
 
   const supabase = db();
   const { data, error } = await supabase
@@ -41,12 +71,12 @@ export async function POST(req: NextRequest) {
       category: t.category,
       urgency: t.urgency,
       sentiment: t.sentiment,
-      status: decision.status,
-      proposed_action: decision.proposedAction,
-      action_taken: decision.actionTaken,
+      status,
+      proposed_action: proposedAction,
+      action_taken: actionTaken,
       draft_reply: decision.draftReply,
-      reason: decision.reason,
-      resolved_at: decision.status === "resolved" ? new Date().toISOString() : null,
+      reason,
+      resolved_at: status === "resolved" ? new Date().toISOString() : null,
     })
     .select("id")
     .single();

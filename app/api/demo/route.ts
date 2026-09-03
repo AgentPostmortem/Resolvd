@@ -2,10 +2,13 @@ import { NextResponse } from "next/server";
 import { db } from "@/lib/supabase";
 import { triage } from "@/lib/agent";
 import { decide } from "@/lib/policy";
+import { executeResolution, sampleShopAdapter } from "@/lib/execute";
 import type { InboundPayload } from "@/lib/types";
 
 export const runtime = "nodejs";
 
+// Senders must stay inside DEMO_SENDERS (lib/demo.ts) so the dashboard can
+// badge these rows as demo. Do not use realistic addresses here.
 const SAMPLES: InboundPayload[] = [
   { sender: "sam@buyer.com", subject: "Where is my order?", body: "Hi, can you tell me the status of my order?", orderId: "1042" },
   { sender: "jo@buyer.com", subject: "Refund please", body: "please refund $18 for the damaged item" },
@@ -15,10 +18,37 @@ const SAMPLES: InboundPayload[] = [
 
 // POST /api/demo, public, no token. Lets a website visitor inject one realistic
 // support ticket so they can watch the triage + policy decision happen live.
+// Runs against an explicitly fake sample store (never touches real systems);
+// the dashboard badges these rows as demo.
 export async function POST() {
   const pick = SAMPLES[Math.floor(Math.random() * SAMPLES.length)];
   const t = await triage(pick.subject ?? "", pick.body);
-  const decision = decide(t, pick);
+  const decision = decide(t, pick, { shopify: true, email: false });
+
+  let status = decision.status;
+  let proposedAction = decision.proposedAction;
+  let actionTaken = decision.actionTaken;
+  let reason = decision.reason;
+  if (decision.status === "resolved" && decision.execution) {
+    const result = await executeResolution(
+      decision,
+      {
+        sender: pick.sender,
+        subject: pick.subject ?? "",
+        orderRef: pick.orderId ?? null,
+      },
+      sampleShopAdapter(),
+      null,
+      true,
+    );
+    if (result.ok) {
+      actionTaken = result.actionTaken;
+    } else {
+      status = "escalated";
+      proposedAction = result.proposedAction;
+      reason = result.reason;
+    }
+  }
 
   const supabase = db();
   const { data } = await supabase
@@ -31,13 +61,12 @@ export async function POST() {
       category: t.category,
       urgency: t.urgency,
       sentiment: t.sentiment,
-      status: decision.status,
-      proposed_action: decision.proposedAction,
-      action_taken: decision.actionTaken,
+      status,
+      proposed_action: proposedAction,
+      action_taken: actionTaken,
       draft_reply: decision.draftReply,
-      reason: decision.reason,
-      resolved_at:
-        decision.status === "resolved" ? new Date().toISOString() : null,
+      reason,
+      resolved_at: status === "resolved" ? new Date().toISOString() : null,
     })
     .select("id")
     .single();
@@ -57,9 +86,9 @@ export async function POST() {
     id: (data as { id: string }).id,
     subject: pick.subject,
     category: t.category,
-    status: decision.status,
-    proposedAction: decision.proposedAction,
-    actionTaken: decision.actionTaken,
-    reason: decision.reason,
+    status,
+    proposedAction,
+    actionTaken,
+    reason,
   });
 }

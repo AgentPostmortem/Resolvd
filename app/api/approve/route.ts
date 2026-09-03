@@ -1,5 +1,8 @@
 import { NextRequest, NextResponse } from "next/server";
 import { db, checkInboundToken } from "@/lib/supabase";
+import { executeResolution, liveAdapters } from "@/lib/execute";
+import { readIntegrations } from "@/lib/policy";
+import type { Decision } from "@/lib/policy";
 
 export const runtime = "nodejs";
 
@@ -31,7 +34,9 @@ export async function POST(req: NextRequest) {
   const supabase = db();
   const { data: ticket } = await supabase
     .from("rv_tickets")
-    .select("proposed_action, status")
+    .select(
+      "proposed_action, status, category, sender, subject, body, order_id, draft_reply",
+    )
     .eq("id", id)
     .maybeSingle();
 
@@ -39,23 +44,67 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: "not found" }, { status: 404 });
   }
 
-  const proposed = (ticket as { proposed_action: string | null }).proposed_action;
+  const row = ticket as {
+    proposed_action: string | null;
+    status: string;
+    category: string | null;
+    sender: string;
+    subject: string | null;
+    body: string;
+    order_id: string | null;
+    draft_reply: string | null;
+  };
+  const proposed = row.proposed_action;
+
+  let actionTaken: string;
+  if (!approve) {
+    actionTaken = "Rejected by human";
+  } else {
+    // A human approval also executes the action when it is executable and
+    // the store is connected. Anything that cannot run stays a manual task.
+    actionTaken = `Approved by human: ${proposed ?? "action"}`;
+    const integrations = readIntegrations();
+    const amountMatch = row.body.match(/\$\s?(\d+(?:\.\d{1,2})?)/);
+    const executable: Decision["execution"] =
+      row.category === "refund" && amountMatch
+        ? { kind: "refund", amount: parseFloat(amountMatch[1]) }
+        : row.category === "order_status" && row.order_id
+          ? { kind: "order_lookup" }
+          : null;
+    if (executable && integrations.shopify) {
+      const decision: Decision = {
+        status: "resolved",
+        proposedAction: proposed ?? "approved action",
+        actionTaken: null,
+        reason: "approved by human",
+        draftReply: row.draft_reply ?? "",
+        execution: executable,
+      };
+      const { shop, mail } = liveAdapters();
+      const result = await executeResolution(
+        decision,
+        {
+          sender: row.sender,
+          subject: row.subject ?? "",
+          orderRef: row.order_id,
+        },
+        shop,
+        integrations.email ? mail : null,
+        false,
+      );
+      actionTaken = result.ok
+        ? `Approved by human: ${result.actionTaken}`
+        : `Approved by human, execution failed (${result.reason}); handle manually`;
+    }
+  }
 
   const { error } = await supabase
     .from("rv_tickets")
-    .update(
-      approve
-        ? {
-            status: "resolved",
-            action_taken: `Approved by human: ${proposed ?? "action"}`,
-            resolved_at: new Date().toISOString(),
-          }
-        : {
-            status: "resolved",
-            action_taken: "Rejected by human",
-            resolved_at: new Date().toISOString(),
-          },
-    )
+    .update({
+      status: "resolved",
+      action_taken: actionTaken,
+      resolved_at: new Date().toISOString(),
+    })
     .eq("id", id);
 
   if (error) {
