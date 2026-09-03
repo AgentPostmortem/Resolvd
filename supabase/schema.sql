@@ -15,9 +15,11 @@ create table if not exists rv_tickets (
   draft_reply     text,
   reason          text,         -- why it escalated / auto-resolved
   created_at      timestamptz not null default now(),
-  resolved_at     timestamptz
+  resolved_at     timestamptz,
+  source          text not null default 'api' -- api | demo
 );
 
 create index if not exists rv_tickets_status_idx  on rv_tickets(status, created_at desc);
+create index if not exists rv_tickets_source_idx  on rv_tickets(source, created_at desc);
 
 alter table rv_tickets enable row level security;

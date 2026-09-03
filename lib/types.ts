@@ -29,6 +29,9 @@ export interface Ticket {
   reason: string | null;
   created_at: string;
   resolved_at: string | null;
+  // Set once supabase/migrations/002_add_source.sql has been applied.
+  // Until then the dashboard falls back to matching demo senders.
+  source?: string | null;
 }
 
 export interface InboundPayload {

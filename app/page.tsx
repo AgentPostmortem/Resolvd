@@ -1,6 +1,7 @@
 import Link from "next/link";
 import { db } from "@/lib/supabase";
 import type { Ticket } from "@/lib/types";
+import { demoExclusionFilter, isDemoTicket } from "@/lib/demo";
 import { DemoButton } from "@/components/DemoButton";
 import { AiDigest } from "@/components/AiDigest";
 
@@ -16,14 +17,17 @@ const FILTERS = [
 export default async function Home({
   searchParams,
 }: {
-  searchParams: { page?: string; status?: string };
+  searchParams: Promise<{ page?: string; status?: string; demo?: string }>;
 }) {
   const supabase = db();
+  const params = await searchParams;
   const status =
-    searchParams.status === "escalated" || searchParams.status === "resolved"
-      ? searchParams.status
+    params.status === "escalated" || params.status === "resolved"
+      ? params.status
       : "all";
-  const page = Math.max(1, parseInt(searchParams.page ?? "1", 10) || 1);
+  // Demo rows are labeled, and a buyer can hide them to see live traffic only.
+  const hideDemo = params.demo === "hide";
+  const page = Math.max(1, parseInt(params.page ?? "1") || 1);
   const from = (page - 1) * PER_PAGE;
   const to = from + PER_PAGE - 1;
 
@@ -32,6 +36,7 @@ export default async function Home({
       .from("rv_tickets")
       .select("*", { count: "exact", head: true });
     if (s) q = q.eq("status", s);
+    if (hideDemo) q = q.not("sender", "in", demoExclusionFilter());
     return (await q).count ?? 0;
   };
   // Same queries, run concurrently so SSR TTFB is one roundtrip, not three.
@@ -52,8 +57,10 @@ export default async function Home({
     .select("*")
     .order("created_at", { ascending: false });
   if (status !== "all") listQ = listQ.eq("status", status);
+  if (hideDemo) listQ = listQ.not("sender", "in", demoExclusionFilter());
   const { data } = await listQ.range(from, to);
   const tickets = (data ?? []) as Ticket[];
+  const demoParam = hideDemo ? "&demo=hide" : "";
 
   return (
     <div className="space-y-6">
@@ -148,7 +155,7 @@ export default async function Home({
             return (
               <Link
                 key={f.key}
-                href={f.key === "all" ? "/" : `/?status=${f.key}`}
+                href={f.key === "all" ? `/${demoParam ? `?demo=hide` : ""}` : `/?status=${f.key}${demoParam}`}
                 className={`flex items-center gap-2 rounded-lg border px-3 py-2 text-[13px] transition lg:justify-between ${
                   active
                     ? "border-accent/50 bg-accent/10 text-text"
@@ -167,6 +174,41 @@ export default async function Home({
             New messages are triaged automatically. Safe cases are actioned;
             risky ones land in <span className="text-warn">Escalated</span>.
           </div>
+          <div className="hidden rounded-lg border border-border bg-surface p-3 text-[12px] leading-relaxed text-muted lg:block">
+            <span className="font-medium text-text">Integrations</span>
+            <ul className="mt-1.5 space-y-1">
+              <IntegrationRow
+                ok={Boolean(
+                  process.env.SHOPIFY_SHOP_DOMAIN &&
+                    process.env.SHOPIFY_ACCESS_TOKEN,
+                )}
+                label="Shopify store"
+              />
+              <IntegrationRow
+                ok={Boolean(
+                  process.env.RESEND_API_KEY && process.env.RESEND_FROM_EMAIL,
+                )}
+                label="Reply email"
+              />
+            </ul>
+            <p className="mt-2">
+              Unconnected work escalates with instructions instead of acting.
+            </p>
+          </div>
+          <Link
+            href={
+              hideDemo
+                ? status === "all"
+                  ? "/"
+                  : `/?status=${status}`
+                : status === "all"
+                  ? "/?demo=hide"
+                  : `/?status=${status}&demo=hide`
+            }
+            className="rounded-lg border border-dashed border-border bg-transparent px-3 py-2 text-[13px] text-muted transition hover:border-accent/50 hover:text-text"
+          >
+            {hideDemo ? "Show demo tickets" : "Hide demo tickets"}
+          </Link>
         </aside>
 
         <section className="min-w-0 space-y-3">
@@ -180,7 +222,12 @@ export default async function Home({
             </div>
           )}
           {totalPages > 1 && (
-            <Pagination status={status} page={page} totalPages={totalPages} />
+            <Pagination
+              status={status}
+              page={page}
+              totalPages={totalPages}
+              demoParam={demoParam}
+            />
           )}
         </section>
       </div>
@@ -214,6 +261,14 @@ function TicketRow({ t }: { t: Ticket }) {
             <div className="text-[12px] text-muted">{t.sender}</div>
           </div>
         </div>
+        {isDemoTicket(t) && (
+          <span
+            title="Sample ticket from the public demo, not real support work"
+            className="shrink-0 rounded-md border border-dashed border-border-soft bg-transparent px-2 py-0.5 text-[11px] uppercase tracking-wider text-muted"
+          >
+            demo
+          </span>
+        )}
         {t.category && (
           <span className="shrink-0 rounded-md border border-border-soft bg-bg px-2 py-0.5 text-[11px] text-muted">
             {t.category}
@@ -383,6 +438,19 @@ function TriagePanel({
   );
 }
 
+function IntegrationRow({ ok, label }: { ok: boolean; label: string }) {
+  return (
+    <li className="flex items-center gap-2">
+      <span
+        className={`h-1.5 w-1.5 rounded-full ${ok ? "bg-good" : "bg-muted"}`}
+      />
+      <span>
+        {label}: {ok ? "connected" : "not connected"}
+      </span>
+    </li>
+  );
+}
+
 function Dot({ k }: { k: string }) {
   const c =
     k === "escalated" ? "bg-warn" : k === "resolved" ? "bg-good" : "bg-accent";
@@ -401,12 +469,19 @@ function Pagination({
   status,
   page,
   totalPages,
+  demoParam,
 }: {
   status: string;
   page: number;
   totalPages: number;
+  demoParam: string;
 }) {
-  const base = status === "all" ? "/?" : `/?status=${status}&`;
+  const base =
+    status === "all"
+      ? demoParam
+        ? `/?demo=hide&`
+        : "/?"
+      : `/?status=${status}${demoParam}&`;
   const linkCls =
     "rounded-lg border border-border bg-surface px-3 py-1.5 text-[13px] transition hover:border-accent/50 hover:text-text";
   // At either edge the control is omitted entirely (empty spacer keeps the
