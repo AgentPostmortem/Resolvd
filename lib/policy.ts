@@ -91,7 +91,10 @@ export function decide(
     }
 
     case "refund": {
-      const amount = triage.refundAmount ?? null;
+      const amount = Number.isFinite(triage.refundAmount)
+        ? triage.refundAmount
+        : null;
+
       if (amount == null) {
         return escalated(
           "Confirm refund amount, then approve",
