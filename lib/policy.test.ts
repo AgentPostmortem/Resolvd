@@ -54,6 +54,17 @@ describe("decide", () => {
     expect(d.proposedAction).toMatch(/amount/i);
   });
 
+  it("escalates a refund whose amount is NaN instead of auto-resolving", () => {
+    const d = decide(
+      { ...base, category: "refund", refundAmount: NaN },
+      { ...payload, orderId: "1042" },
+      ON,
+    );
+    expect(d.status).toBe("escalated");
+    expect(d.execution).toBeNull();
+    expect(d.proposedAction).toMatch(/amount/i);
+  });
+
   it("honors a custom REFUND_AUTO_LIMIT", () => {
     process.env.REFUND_AUTO_LIMIT = "10";
     expect(
